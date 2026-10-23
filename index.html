@@ -1,0 +1,456 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>zw relay api</title>
+<pre id="out">{ "status": "connecting" }</pre>
+<script>
+(() => {
+  'use strict';
+
+  const urlParams = new URLSearchParams(location.search);
+
+  const CONFIG = {
+    relayUrl: urlParams.get('relay') || 'ws://89.167.56.155:7770/',
+    username: urlParams.get('user') || 'jfdvgIa59',
+    password: urlParams.get('pass') || 'a9p4gBSCuDlCRd1VOlk',
+    authKey: urlParams.get('key') || '',
+    gameVersion: urlParams.get('version') || '',
+    protocolVersion: Number(urlParams.get('proto')) || 4
+  };
+
+  const Opcode = {
+    AUTH: 1,
+    REQUEST_ROOM_LIST: 5,
+    AUTH_RESPONSE: 20,
+    ROOM_LIST: 26,
+    DISCONNECTING: 30
+  };
+
+  const RoomFieldLimits = {
+    ID: 128,
+    NAME: 64,
+    DATA: 1024
+  };
+
+  const AUTH_ERROR_MESSAGES = [
+    '',
+    'invalid authentication key',
+    'relay protocol version mismatch',
+    'already authenticated',
+    'relay server is full',
+    'invalid username or password',
+    'account service is unavailable',
+    'account already connected elsewhere',
+    'guests are not allowed',
+    'too many authentication attempts from this IP',
+    'account not allowed'
+  ];
+
+  const FATAL_AUTH_RESULTS = new Set([1, 2, 5, 7, 8, 10]);
+
+  const textEncoder = new TextEncoder();
+  const textDecoder = new TextDecoder('utf-8');
+  const outputElement = document.getElementById('out');
+
+  const REQUEST_ROOMS_PACKET = new Uint8Array([Opcode.REQUEST_ROOM_LIST, 0]);
+  const AUTH_PACKET = buildAuthPacket();
+
+  function buildAuthPacket() {
+    const encodedStrings = [
+      textEncoder.encode(CONFIG.authKey),
+      textEncoder.encode(CONFIG.username),
+      textEncoder.encode(CONFIG.password),
+      textEncoder.encode(CONFIG.gameVersion)
+    ];
+
+    let totalLength = 4;
+    for (let i = 0; i < 4; i++) {
+      const len = encodedStrings[i].length;
+      if (len > 65535) {
+        throw new Error('string exceeds maximum byte length');
+      }
+      totalLength += 2 + len;
+    }
+
+    const packet = new Uint8Array(totalLength);
+    let offset = 0;
+
+    packet[offset++] = Opcode.AUTH;
+    packet[offset++] = CONFIG.protocolVersion & 255;
+    packet[offset++] = (CONFIG.protocolVersion >> 8) & 255;
+
+    for (let i = 0; i < 4; i++) {
+      const bytes = encodedStrings[i];
+      const len = bytes.length;
+      packet[offset++] = len & 255;
+      packet[offset++] = (len >> 8) & 255;
+      packet.set(bytes, offset);
+      offset += len;
+    }
+
+    packet[offset] = 0;
+    return packet;
+  }
+
+  function renderJson(data) {
+    outputElement.textContent = JSON.stringify(data, null, 2);
+  }
+
+  function renderError(code, message, extra) {
+    renderJson({
+      relay: CONFIG.relayUrl,
+      fetchedAt: new Date().toISOString(),
+      error: { code, message },
+      ...extra
+    });
+  }
+
+  function parseRoomData(raw) {
+    if (!raw) return null;
+    const firstChar = raw.charCodeAt(0);
+    if (firstChar !== 123 && firstChar !== 91) return raw;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  class PacketReader {
+    constructor() {
+      this.bytes = null;
+      this.length = 0;
+      this.offset = 0;
+    }
+
+    reset(arrayBuffer) {
+      this.bytes = new Uint8Array(arrayBuffer);
+      this.length = this.bytes.length;
+      this.offset = 0;
+    }
+
+    get remaining() {
+      return this.length - this.offset;
+    }
+
+    ensureAvailable(byteCount, errorMessage) {
+      if (this.offset + byteCount > this.length) {
+        throw new Error(errorMessage);
+      }
+    }
+
+    readUint8(errorMessage = 'unexpected end of packet') {
+      this.ensureAvailable(1, errorMessage);
+      return this.bytes[this.offset++];
+    }
+
+    readBool(errorMessage = 'unexpected end of packet') {
+      return this.readUint8(errorMessage) !== 0;
+    }
+
+    readUint16(errorMessage = 'unexpected end of packet') {
+      this.ensureAvailable(2, errorMessage);
+      const bytes = this.bytes;
+      const offset = this.offset;
+      this.offset = offset + 2;
+      return bytes[offset] | (bytes[offset + 1] << 8);
+    }
+
+    readInt32(errorMessage = 'unexpected end of packet') {
+      this.ensureAvailable(4, errorMessage);
+      const bytes = this.bytes;
+      const offset = this.offset;
+      this.offset = offset + 4;
+      return (
+        bytes[offset] |
+        (bytes[offset + 1] << 8) |
+        (bytes[offset + 2] << 16) |
+        (bytes[offset + 3] << 24)
+      );
+    }
+
+    readString(maxBytes = 65535) {
+      const length = this.readUint16('short string length');
+      if (length > maxBytes) {
+        throw new Error(`string length ${length} exceeds limit of ${maxBytes}`);
+      }
+      if (length === 0) return '';
+      this.ensureAvailable(length, 'short string body');
+      const start = this.offset;
+      this.offset = start + length;
+      return textDecoder.decode(this.bytes.subarray(start, this.offset));
+    }
+  }
+
+  class RelayMonitor {
+    constructor() {
+      this.ws = null;
+      this.isAuthenticated = false;
+      this.shouldReconnect = true;
+      this.reconnectDelayMs = 1500;
+      this.pendingRooms = new Map();
+      this.reader = new PacketReader();
+
+      this.authTimer = 0;
+      this.pollTimer = 0;
+      this.reconnectTimer = 0;
+      this.chunkSettleTimer = 0;
+
+      this.boundConnect = () => this.connect();
+      this.boundRequestRooms = () => this.requestRoomList();
+      this.boundPublishRooms = () => this.publishRoomList();
+      this.boundAuthTimeout = () => this.onAuthTimeout();
+      this.boundOnOpen = (e) => this.onOpen(e.currentTarget);
+      this.boundOnMessage = (e) => this.onMessage(e.currentTarget, e);
+      this.boundOnClose = (e) => this.onClose(e.currentTarget);
+      this.boundOnError = (e) => this.onError(e.currentTarget);
+    }
+
+    start() {
+      this.connect();
+    }
+
+    connect() {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = 0;
+      this.closeCurrentSocket();
+      this.resetSessionState();
+
+      let socket;
+      try {
+        socket = new WebSocket(CONFIG.relayUrl);
+      } catch (error) {
+        renderError('ws_open_failed', error.message);
+        this.scheduleReconnect();
+        return;
+      }
+
+      this.ws = socket;
+      socket.binaryType = 'arraybuffer';
+
+      socket.onopen = this.boundOnOpen;
+      socket.onmessage = this.boundOnMessage;
+      socket.onclose = this.boundOnClose;
+      socket.onerror = this.boundOnError;
+    }
+
+    onOpen(socket) {
+      if (this.ws !== socket) return;
+
+      this.sendPacket(AUTH_PACKET);
+
+      clearTimeout(this.authTimer);
+      this.authTimer = setTimeout(this.boundAuthTimeout, 8000);
+    }
+
+    onAuthTimeout() {
+      this.authTimer = 0;
+      if (this.ws && !this.isAuthenticated) {
+        renderError('auth_timeout', 'no authentication response');
+        this.closeCurrentSocket();
+      }
+    }
+
+    onMessage(socket, event) {
+      if (this.ws !== socket) return;
+      const data = event.data;
+      if (!(data instanceof ArrayBuffer) || data.byteLength === 0) return;
+
+      const reader = this.reader;
+      reader.reset(data);
+
+      switch (reader.readUint8()) {
+        case Opcode.AUTH_RESPONSE:
+          this.handleAuthResponse(reader);
+          break;
+        case Opcode.ROOM_LIST:
+          this.handleRoomListChunk(reader);
+          break;
+        case Opcode.DISCONNECTING:
+          this.handleDisconnecting(reader);
+          break;
+      }
+    }
+
+    onClose(socket) {
+      if (this.ws !== socket) return;
+
+      this.ws = null;
+      this.isAuthenticated = false;
+      clearInterval(this.pollTimer);
+      clearTimeout(this.authTimer);
+      this.pollTimer = 0;
+      this.authTimer = 0;
+
+      if (this.shouldReconnect) {
+        this.scheduleReconnect();
+      }
+    }
+
+    onError(socket) {
+      if (this.ws === socket && !this.isAuthenticated) {
+        renderError('ws_error', 'cannot reach the relay');
+      }
+    }
+
+    handleAuthResponse(reader) {
+      const resultCode = reader.readUint8();
+      clearTimeout(this.authTimer);
+      this.authTimer = 0;
+
+      if (resultCode !== 0) {
+        const extra = { authResult: resultCode };
+
+        if (resultCode === 2 && reader.remaining >= 2) {
+          extra.serverProtocolVersion = reader.readUint16();
+        }
+
+        if (FATAL_AUTH_RESULTS.has(resultCode)) {
+          this.shouldReconnect = false;
+        }
+
+        renderError('auth_failed', AUTH_ERROR_MESSAGES[resultCode] || 'authentication failed', extra);
+        this.closeCurrentSocket();
+        return;
+      }
+
+      this.isAuthenticated = true;
+      this.shouldReconnect = true;
+      this.reconnectDelayMs = 1500;
+
+      this.requestRoomList();
+      clearInterval(this.pollTimer);
+      this.pollTimer = setInterval(this.boundRequestRooms, 5000);
+    }
+
+    handleDisconnecting(reader) {
+      const reasonCode = reader.remaining >= 1 ? reader.readUint8() : 0;
+      renderError('relay_disconnecting', 'relay is closing the connection', {
+        disconnectReason: reasonCode
+      });
+    }
+
+    requestRoomList() {
+      if (!this.isAuthenticated) return;
+      this.pendingRooms.clear();
+      this.sendPacket(REQUEST_ROOMS_PACKET);
+    }
+
+    handleRoomListChunk(reader) {
+      let isFinalChunk = false;
+
+      try {
+        isFinalChunk = reader.readBool('short room list header');
+        const roomCount = reader.readUint16('short room list header');
+
+        if (roomCount > 4095) {
+          throw new Error('invalid room count');
+        }
+
+        const pending = this.pendingRooms;
+        for (let i = 0; i < roomCount; i++) {
+          const room = this.parseRoomEntry(reader);
+          pending.set(room.id, room);
+        }
+      } catch (error) {
+        renderError('parse_failed', error.message);
+        return;
+      }
+
+      clearTimeout(this.chunkSettleTimer);
+      if (isFinalChunk) {
+        this.chunkSettleTimer = 0;
+        this.publishRoomList();
+      } else {
+        this.chunkSettleTimer = setTimeout(this.boundPublishRooms, 1000);
+      }
+    }
+
+    parseRoomEntry(reader) {
+      const id = reader.readString(RoomFieldLimits.ID);
+      const name = reader.readString(RoomFieldLimits.NAME);
+
+      reader.ensureAvailable(9, 'short room entry');
+      const isVisible = reader.readBool();
+      const rawPlayers = reader.readInt32();
+      const rawMax = reader.readInt32();
+      const rawRoomData = reader.readString(RoomFieldLimits.DATA);
+
+      return {
+        id,
+        name,
+        isVisible,
+        playerCount: rawPlayers > 0 ? rawPlayers : 0,
+        maxPlayers: rawMax > 0 ? rawMax : 0,
+        roomData: parseRoomData(rawRoomData)
+      };
+    }
+
+    publishRoomList() {
+      this.chunkSettleTimer = 0;
+      const pending = this.pendingRooms;
+      const rooms = new Array(pending.size);
+      let totalPlayers = 0;
+      let index = 0;
+
+      for (const room of pending.values()) {
+        rooms[index++] = room;
+        totalPlayers += room.playerCount;
+      }
+
+      renderJson({
+        relay: CONFIG.relayUrl,
+        fetchedAt: new Date().toISOString(),
+        totalPlayers,
+        rooms
+      });
+    }
+
+    sendPacket(bytes) {
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      try {
+        ws.send(bytes);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    scheduleReconnect() {
+      clearTimeout(this.reconnectTimer);
+      const jitter = (Math.random() * 5000) | 0;
+      const delay = this.reconnectDelayMs + jitter;
+      this.reconnectDelayMs = Math.min(15000, (this.reconnectDelayMs * 1.6 + 0.5) | 0);
+      this.reconnectTimer = setTimeout(this.boundConnect, delay);
+    }
+
+    closeCurrentSocket() {
+      const previousSocket = this.ws;
+      this.ws = null;
+      if (previousSocket) {
+        previousSocket.onopen = null;
+        previousSocket.onmessage = null;
+        previousSocket.onclose = null;
+        previousSocket.onerror = null;
+        try {
+          previousSocket.close();
+        } catch {}
+      }
+    }
+
+    resetSessionState() {
+      clearInterval(this.pollTimer);
+      clearTimeout(this.authTimer);
+      clearTimeout(this.chunkSettleTimer);
+      this.pollTimer = 0;
+      this.authTimer = 0;
+      this.chunkSettleTimer = 0;
+      this.isAuthenticated = false;
+      this.pendingRooms.clear();
+    }
+  }
+
+  new RelayMonitor().start();
+})();
+</script>
