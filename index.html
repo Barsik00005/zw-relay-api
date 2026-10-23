@@ -220,9 +220,20 @@
       try {
         socket = new WebSocket(CONFIG.relayUrl);
       } catch (error) {
-        renderError('ws_open_failed', error.message);
-        this.scheduleReconnect();
-        return;
+        if (CONFIG.relayUrl.startsWith('ws://')) {
+          CONFIG.relayUrl = 'wss://' + CONFIG.relayUrl.slice(5);
+          try {
+            socket = new WebSocket(CONFIG.relayUrl);
+          } catch (retryError) {
+            renderError('ws_open_failed', retryError.message);
+            this.scheduleReconnect();
+            return;
+          }
+        } else {
+          renderError('ws_open_failed', error.message);
+          this.scheduleReconnect();
+          return;
+        }
       }
 
       this.ws = socket;
